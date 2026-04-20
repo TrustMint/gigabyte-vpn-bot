@@ -28,7 +28,7 @@ from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton, ErrorEvent,
     BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton,
     LabeledPrice, PreCheckoutQuery, SuccessfulPayment, CallbackQuery,
-    FSInputFile
+    FSInputFile, InputMediaPhoto
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -351,7 +351,8 @@ class XUIApi:
             return False
         try:
             r = await self.client.post(
-                f"{self.base_url}/panel/api/inbounds/delClient/{self.server['inbound_id']}/{client_uuid}",
+                f"{self.base_url}/panel/api/inbounds/delClient",
+                json={"id": self.server["inbound_id"], "clientId": client_uuid},
                 cookies=self.cookies,
                 headers={"Content-Type": "application/json"}
             )
@@ -1908,15 +1909,45 @@ async def os_instructions_callback(callback: CallbackQuery):
         )
     }
 
-    # Отправляем изображение, если оно существует
-    image_path = f"instructions/{os_type}.jpg"
-    if os.path.exists(image_path):
-        try:
-            await callback.message.answer_photo(FSInputFile(image_path))
-        except Exception as e:
-            logger.warning(f"Не удалось отправить изображение {image_path}: {e}")
+    caption = texts.get(os_type, "Инструкция в разработке")
 
-    await callback.message.answer(texts.get(os_type, "Инструкция в разработке"), parse_mode=ParseMode.HTML)
+    # Собираем все существующие изображения для данной ОС
+    media_files = []
+    base_path = f"instructions/{os_type}"
+    # Основной файл (например, instructions/android.jpg)
+    if os.path.exists(f"{base_path}.jpg"):
+        media_files.append(f"{base_path}.jpg")
+    # Дополнительные файлы с индексами (например, instructions/android_1.jpg, android_2.jpg, ...)
+    idx = 1
+    while os.path.exists(f"{base_path}_{idx}.jpg"):
+        media_files.append(f"{base_path}_{idx}.jpg")
+        idx += 1
+
+    if not media_files:
+        # Если нет ни одного изображения, отправляем только текст
+        await callback.message.answer(caption, parse_mode=ParseMode.HTML)
+        await callback.answer()
+        return
+
+    if len(media_files) == 1:
+        # Одно изображение – отправляем как фото с подписью
+        await callback.message.answer_photo(
+            FSInputFile(media_files[0]),
+            caption=caption,
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        # Несколько изображений – формируем медиагруппу
+        media_group = []
+        for i, file_path in enumerate(media_files):
+            if i == 0:
+                media_group.append(
+                    InputMediaPhoto(media=FSInputFile(file_path), caption=caption, parse_mode=ParseMode.HTML)
+                )
+            else:
+                media_group.append(InputMediaPhoto(media=FSInputFile(file_path)))
+        await callback.message.answer_media_group(media=media_group)
+
     await callback.answer()
 
 # ====================== ПОДДЕРЖКА (ТИКЕТЫ) ======================
@@ -2188,11 +2219,15 @@ async def user_delete_self(message: Message):
         return
 
     # Собираем данные пользователя для показа
-    user_info = await supabase.table("users").select("*").eq("user_id", user_id).single().execute()
+    user_res = await supabase.table("users").select("*").eq("user_id", user_id).execute()
+    if not user_res.data:
+        await message.answer("❌ Пользователь не найден.")
+        return
+    user_info = user_res.data[0]
     subs = await supabase.table("subscriptions").select("*").eq("user_id", user_id).execute()
     payments = await supabase.table("payments").select("amount_rub, status").eq("user_id", user_id).execute()
     total_paid = sum(p["amount_rub"] for p in payments.data if p["status"] == "completed")
-    reg_date = datetime.fromisoformat(user_info.data["created_at"]).strftime("%d.%m.%Y %H:%M") if user_info.data.get("created_at") else "неизвестно"
+    reg_date = datetime.fromisoformat(user_info["created_at"]).strftime("%d.%m.%Y %H:%M") if user_info.get("created_at") else "неизвестно"
 
     text = (
         "⚠️ <b>ВНИМАНИЕ! Удаление аккаунта</b>\n\n"
@@ -2379,12 +2414,8 @@ async def admin_stats(message: Message):
         return
     users_cnt = await supabase.table("users").select("*", count="exact").execute()
     active_cnt = await supabase.table("subscriptions").select("*", count="exact").eq("status", "active").execute()
-    revenue = await supabase.rpc("get_total_revenue")
-    if not revenue.data:
-        rev_res = await supabase.table("payments").select("amount_rub").eq("status", "completed").execute()
-        total_rev = sum(p["amount_rub"] for p in rev_res.data) if rev_res.data else 0
-    else:
-        total_rev = revenue.data
+    rev_res = await supabase.table("payments").select("amount_rub").eq("status", "completed").execute()
+    total_rev = sum(p["amount_rub"] for p in rev_res.data) if rev_res.data else 0
     pending_cnt = await supabase.table("payments").select("*", count="exact").in_("status", ["pending_crypto", "awaiting_hash"]).execute()
     tickets_cnt = await supabase.table("tickets").select("*", count="exact").eq("status", "open").execute()
     await message.answer(
