@@ -1,0 +1,6 @@
+aiogram
+python-telegram-bot
+supabase
+httpx
+qrcode
+python-dotenv
